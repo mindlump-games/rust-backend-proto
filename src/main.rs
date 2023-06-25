@@ -24,7 +24,7 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct MessageHeader {
     rpc: RpcName,
     body_size: usize,
@@ -106,7 +106,7 @@ pub enum BackendRpcRetVariant {
 }
 pub const EXAMPLE_RPC_ID: &str = &"ExampleRpc";
 /// User to implement handlers
-trait BackendHandler {
+trait BackendRpcHandler {
     fn handle_example_message(&mut self, msg: ExampleMessage) -> Result<ExampleReturn, ()>;
     fn handle_rpc_received(
         &mut self,
@@ -121,25 +121,15 @@ trait BackendHandler {
 }
 
 trait BackendServiceClient {
-    fn call_example_message(&mut self, arg: &ExampleMessage) -> Result<ExampleReturn, ()>;
-    fn call<M: Serialize>(&mut self, arg: &M, rpc_id: String) -> Result<BackendRpcRetVariant, ()>;
-}
-
-fn other() {
-    let mut chan = UDPChannel {
-        socket: UdpSocket::bind("").unwrap(),
-        dst: None,
-    };
-    chan.call_example_message(&ExampleMessage {
-        msg: String::from("Hello"),
-    });
+    fn call_example_message(&mut self, arg: ExampleMessage) -> Result<ExampleReturn, ()>;
+    fn call(&mut self, arg: &BackendRpcArgVariant) -> Result<BackendRpcRetVariant, ()>;
 }
 
 trait BackendService {
-    fn handler_loop<H: BackendHandler>(&mut self, handler: H, addr: &str) -> Result<(), ()>;
+    fn handler_loop<H: BackendRpcHandler>(&mut self, handler: H, addr: &str) -> Result<(), ()>;
 }
 impl<C: MessageChannel> BackendService for C {
-    fn handler_loop<H: BackendHandler>(&mut self, mut handler: H, addr: &str) -> Result<(), ()> {
+    fn handler_loop<H: BackendRpcHandler>(&mut self, mut handler: H, addr: &str) -> Result<(), ()> {
         let mut buf = [0u8; 4096];
         loop {
             // TODO(error_handling) Listen for message
@@ -169,8 +159,8 @@ impl<C: MessageChannel> BackendService for C {
 }
 
 impl<C: MessageChannel> BackendServiceClient for C {
-    fn call_example_message(&mut self, arg: &ExampleMessage) -> Result<ExampleReturn, ()> {
-        match self.call(arg, String::from(EXAMPLE_RPC_ID))? {
+    fn call_example_message(&mut self, arg: ExampleMessage) -> Result<ExampleReturn, ()> {
+        match self.call(&BackendRpcArgVariant::ExampleRpc(arg))? {
             BackendRpcRetVariant::ExampleRpc(res) => Ok(res),
             // TODO(error_handling): Unexpected result type received.
             _ => Err(()),
@@ -182,23 +172,15 @@ impl<C: MessageChannel> BackendServiceClient for C {
     // return value, we would require them to provide a handler in the queue
     // submit() function. (Submit would then be responsible for parsing all
     // return values and calling the correct return handlers.)
-    fn call<M: Serialize>(&mut self, arg: &M, rpc_id: String) -> Result<BackendRpcRetVariant, ()> {
-        //FiXME: bind addr
-        let mut body = serde_json::to_vec(arg).unwrap();
-        let header = MessageHeader {
-            rpc: rpc_id,
-            body_size: body.len(),
-            is_return: false,
-        };
-        let mut buf = serde_json::to_vec(&header).unwrap();
-        buf.append(&mut body);
-        self.send(&buf);
+    fn call(&mut self, arg: &BackendRpcArgVariant) -> Result<BackendRpcRetVariant, ()> {
+        self.send(&BackendSerializer::serialize_rpc_arg(arg))
+            .or(Err(()))?;
 
         // Now wait for response. (See optimize todo on function header, no need
         // to wait one.)
         let mut recv_buf = [0u8; 4096];
-        let amt = self.recv(&mut buf).or(Err(()))?;
-        if let Some((_new_start, msg)) = BackendSerializer::parse_rpc_result(&buf[..amt]) {
+        let amt = self.recv(&mut recv_buf).or(Err(()))?;
+        if let Some((_new_start, msg)) = BackendSerializer::parse_rpc_result(&recv_buf[..amt]) {
             Ok(msg)
         } else {
             Err(())
@@ -249,20 +231,42 @@ impl BackendSerializer {
         Some((end.try_into().ok()?, msg))
     }
 
+    pub fn serialize_rpc_arg(arg: &BackendRpcArgVariant) -> Vec<u8> {
+        let mut body;
+        let rpc_id;
+        match arg {
+            BackendRpcArgVariant::ExampleRpc(ref arg) => {
+                body = serde_json::to_vec(arg).unwrap();
+                rpc_id = EXAMPLE_RPC_ID;
+            }
+        }
+        let header = MessageHeader {
+            rpc: rpc_id.to_string(),
+            body_size: body.len(),
+            is_return: false,
+        };
+        let mut buf = serde_json::to_vec(&header).unwrap();
+        buf.append(&mut body);
+        buf
+    }
+
     // TODO(optimization): Should support serializing into a buffer rather than
     // allocating (multiple) vecs.
     pub fn serialize_rpc_ret(ret: BackendRpcRetVariant) -> Vec<u8> {
-        let mut header = MessageHeader::default();
-        header.is_return = true;
         let mut body;
+        let rpc_id;
         match ret {
             BackendRpcRetVariant::ExampleRpc(r) => {
-                header.rpc = String::from(EXAMPLE_RPC_ID);
+                rpc_id = String::from(EXAMPLE_RPC_ID);
                 body = serde_json::to_vec(&r).unwrap();
             }
         }
 
-        header.body_size = body.len();
+        let header = MessageHeader {
+            rpc: rpc_id,
+            body_size: body.len(),
+            is_return: false,
+        };
         let mut msg = serde_json::to_vec(&header).unwrap();
         msg.append(&mut body);
         return msg;
