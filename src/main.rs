@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::{
+    any::Any,
     borrow::Borrow,
+    collections::VecDeque,
     net::{SocketAddr, UdpSocket},
     num::NonZeroUsize,
     str::FromStr,
@@ -12,7 +14,11 @@ fn main() -> std::io::Result<()> {
     socket.connect(peer.clone());
     let peer = Some(peer);
     //socket.send(&[0u8; 2]).unwrap();
-    let mut chan = UDPChannel { socket, peer };
+    let mut chan = UDPChannel {
+        socket,
+        peer,
+        cache: vec![],
+    };
 
     // First let's be the 'frontend' and call the backend.
     //let res = chan
@@ -31,7 +37,7 @@ fn main() -> std::io::Result<()> {
 
 struct Handler;
 impl BackendRpcHandler for Handler {
-    fn handle_example_message(&mut self, msg: ExampleMessage) -> Result<ExampleReturn, ()> {
+    fn handle_example_message(&mut self, msg: ExampleMessage) -> InternalResult<ExampleReturn> {
         assert_eq!(msg.msg, "hello!");
         return Ok(ExampleReturn {
             msg: "world!".to_string(),
@@ -42,18 +48,24 @@ impl BackendRpcHandler for Handler {
 struct UDPChannel {
     socket: UdpSocket,
     peer: Option<SocketAddr>,
+    cache: Vec<u8>,
 }
+
 impl MessageChannel for UDPChannel {
-    fn send(&mut self, buf: &[u8]) -> Result<usize, ()> {
-        self.socket.send(buf).or(Err(()))
+    fn send(&mut self, buf: &[u8]) -> InternalResult<usize> {
+        self.socket.send(buf).map_err(|e| Error::IoError(e))
     }
 
-    fn recv(&mut self, buf: &mut [u8]) -> Result<usize, ()> {
-        let (amt, dst) = self.socket.recv_from(buf).or(Err(()))?;
+    fn recv(&mut self, buf: &mut [u8]) -> InternalResult<usize> {
+        let (amt, dst) = self.socket.recv_from(buf).map_err(|e| Error::IoError(e))?;
         if self.peer.is_none() {
             self.socket.connect(dst).unwrap();
         }
         Ok(amt)
+    }
+
+    fn cache(&mut self) -> &mut Vec<u8> {
+        &mut self.cache
     }
 }
 
@@ -67,7 +79,7 @@ struct MessageHeader {
 type MessageName = String;
 type RpcName = String;
 
-fn find_json_delimiter(buf: &[u8]) -> Option<NonZeroUsize> {
+fn find_json_delimiter(buf: &[u8]) -> InternalResult<NonZeroUsize> {
     let mut iter = buf.iter();
     if iter.next() == Some(&('{'.to_ascii_lowercase() as u8)) {
         let mut count = 1;
@@ -79,17 +91,24 @@ fn find_json_delimiter(buf: &[u8]) -> Option<NonZeroUsize> {
             if &('}'.to_ascii_lowercase() as u8) == b {
                 indent -= 1;
                 if indent == 0 {
-                    return count.try_into().ok();
+                    // Unsafe ok: We started with 1;
+                    return Ok(unsafe { count.try_into().unwrap_unchecked() });
                 }
             }
         }
     }
-    None
+    Err(Error::EndOfFile)
+}
+
+fn deserialize_from_slice<'a, T: Deserialize<'a>>(slice: &'a [u8]) -> InternalResult<T> {
+    serde_json::from_slice::<T>(slice).or(Err(Error::InvalidParse))
 }
 
 trait MessageChannel {
-    fn send(&mut self, buf: &[u8]) -> Result<usize, ()>;
-    fn recv(&mut self, buf: &mut [u8]) -> Result<usize, ()>;
+    fn send(&mut self, buf: &[u8]) -> InternalResult<usize>;
+    fn recv(&mut self, buf: &mut [u8]) -> InternalResult<usize>;
+    // TODO: Handle streamed data
+    fn cache(&mut self) -> &mut Vec<u8>;
 }
 
 /// For example:
@@ -104,30 +123,32 @@ trait MessageChannel {
 /// }
 
 // Per Message:
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExampleMessage {
     pub msg: String,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExampleReturn {
     pub msg: String,
 }
 
 // Per RPC:
+#[derive(Debug)]
 pub enum BackendRpcArgVariant {
     ExampleRpc(ExampleMessage),
 }
+#[derive(Debug)]
 pub enum BackendRpcRetVariant {
     ExampleRpc(ExampleReturn),
 }
 pub const EXAMPLE_RPC_ID: &str = &"ExampleRpc";
 /// User to implement handlers
 trait BackendRpcHandler {
-    fn handle_example_message(&mut self, msg: ExampleMessage) -> Result<ExampleReturn, ()>;
+    fn handle_example_message(&mut self, msg: ExampleMessage) -> InternalResult<ExampleReturn>;
     fn handle_rpc_received(
         &mut self,
         arg: BackendRpcArgVariant,
-    ) -> Result<BackendRpcRetVariant, ()> {
+    ) -> InternalResult<BackendRpcRetVariant> {
         match arg {
             BackendRpcArgVariant::ExampleRpc(m) => Ok(BackendRpcRetVariant::ExampleRpc(
                 self.handle_example_message(m)?,
@@ -137,52 +158,95 @@ trait BackendRpcHandler {
 }
 
 trait BackendServiceClient {
-    fn call_example_message(&mut self, arg: ExampleMessage) -> Result<ExampleReturn, ()>;
-    fn call(&mut self, arg: &BackendRpcArgVariant) -> Result<BackendRpcRetVariant, ()>;
+    fn call_example_message(&mut self, arg: ExampleMessage) -> InternalResult<ExampleReturn>;
+    fn call(&mut self, arg: &BackendRpcArgVariant) -> InternalResult<BackendRpcRetVariant>;
 }
 
 trait BackendService {
-    fn handler_loop<H: BackendRpcHandler>(&mut self, handler: &mut H) -> Result<(), ()>;
-    fn handle_one<H: BackendRpcHandler>(&mut self, handler: &mut H) -> Result<(), ()>;
+    fn handler_loop<H: BackendRpcHandler>(&mut self, handler: &mut H) -> InternalResult<()>;
+    fn handle_one<H: BackendRpcHandler>(&mut self, handler: &mut H) -> InternalResult<()>;
 }
 impl<C: MessageChannel> BackendService for C {
-    fn handler_loop<H: BackendRpcHandler>(&mut self, handler: &mut H) -> Result<(), ()> {
+    fn handler_loop<H: BackendRpcHandler>(&mut self, handler: &mut H) -> InternalResult<()> {
         loop {
             self.handle_one(handler)?;
         }
     }
-    fn handle_one<H: BackendRpcHandler>(&mut self, handler: &mut H) -> Result<(), ()> {
-        let mut buf = [0u8; 4096];
-        // TODO(error_handling) Listen for message
-        let end = self.recv(&mut buf).unwrap();
 
-        let mut start = 0;
+    fn handle_one<H: BackendRpcHandler>(&mut self, handler: &mut H) -> InternalResult<()> {
+        let msg = recv_msg(self)?;
+        let res = handler.handle_rpc_received(msg)?;
+
+        let ret_buf = BackendSerializer::serialize_rpc_ret(res);
+        let send_offset = 0;
+        let mut rem = ret_buf.len();
         loop {
-            if let Some((new_start, msg)) = BackendSerializer::parse_rpc_recv(&buf[start..end]) {
-                start = new_start.get() + start;
-                // TODO(error_handling): Handle unexpected fail to parse more gracefully.
-                let res = handler
-                    .handle_rpc_received(msg)
-                    .expect("Unexpected failure to parse msg");
+            let sent = self.send(&ret_buf[send_offset..])?;
+            if sent < rem {
+                rem -= sent;
+                continue;
+            }
+            break;
+        }
+        Ok(())
+    }
+}
 
-                // TODO(error_handling): Eventually should queue up multiple returns rather than pushing individual messages.
-                let ret_buf = BackendSerializer::serialize_rpc_ret(res);
-                // TODO(error_handling): Gracefully handle failure to send response.
-                let sent = self.send(&ret_buf).unwrap();
-                assert_eq!(sent, ret_buf.len());
-            } else {
-                return Ok(());
+fn recv_msg<C: MessageChannel>(chan: &mut C) -> InternalResult<BackendRpcArgVariant> {
+    // If anything in buffer, check if can parse.
+    if chan.cache().len() > 0 {
+        if let Ok((offset, msg)) = BackendSerializer::parse_rpc_recv(&chan.cache()) {
+            // TODO(optimize): Change to vecdeque to improve operation.
+            chan.cache().drain(..offset.get());
+            return Ok(msg);
+        }
+    }
+
+    loop {
+        // Not parseable from cache, let's read more.
+        let mut buf = [0u8; 4096];
+        let end = chan.recv(&mut buf).unwrap();
+
+        let mut read_buf = &buf[..end];
+        let mut read_from_cache = false;
+        if chan.cache().len() > 0 {
+            // If there's already data in the cash, parse from there instead of directly from buffer.
+            chan.cache().extend_from_slice(&buf[..end]);
+            read_buf = chan.cache().as_slice();
+            read_from_cache = true;
+        }
+        match BackendSerializer::parse_rpc_recv(read_buf) {
+            Ok((offset, msg)) => {
+                if read_from_cache {
+                    // TODO(optimize): Change to vecdeque to improve operation.
+                    chan.cache().drain(..offset.get());
+                }
+                // Push remaining data
+                if offset.get() < end {
+                    chan.cache().extend(&buf[offset.get()..end]);
+                }
+                return Ok(msg);
+            }
+            Err(Error::EndOfFile) => {
+                // Failed to parse, store new data, continue on
+                chan.cache().extend(&buf[..end]);
+                continue;
+            }
+            Err(e) => {
+                // Failed to parse, something went wrong and the channel is now broken.
+                return Err(e);
             }
         }
     }
 }
 
 impl<C: MessageChannel> BackendServiceClient for C {
-    fn call_example_message(&mut self, arg: ExampleMessage) -> Result<ExampleReturn, ()> {
+    fn call_example_message(&mut self, arg: ExampleMessage) -> InternalResult<ExampleReturn> {
         match self.call(&BackendRpcArgVariant::ExampleRpc(arg))? {
             BackendRpcRetVariant::ExampleRpc(res) => Ok(res),
-            // TODO(error_handling): Unexpected result type received.
-            _ => Err(()),
+            // Allowed to silence error, because only single RPC may be supported on this service.
+            #[allow(unreachable_patterns)]
+            res => Err(Error::InvalidResponseId(format!("{:?}", res))),
         }
     }
 
@@ -191,63 +255,84 @@ impl<C: MessageChannel> BackendServiceClient for C {
     // return value, we would require them to provide a handler in the queue
     // submit() function. (Submit would then be responsible for parsing all
     // return values and calling the correct return handlers.)
-    fn call(&mut self, arg: &BackendRpcArgVariant) -> Result<BackendRpcRetVariant, ()> {
-        self.send(&BackendSerializer::serialize_rpc_arg(arg))
-            .or(Err(()))?;
+    fn call(&mut self, arg: &BackendRpcArgVariant) -> InternalResult<BackendRpcRetVariant> {
+        self.send(&BackendSerializer::serialize_rpc_arg(arg))?;
 
         // Now wait for response. (See optimize todo on function header, no need
         // to wait one.)
         let mut recv_buf = [0u8; 4096];
-        let amt = self.recv(&mut recv_buf).or(Err(()))?;
-        if let Some((_new_start, msg)) = BackendSerializer::parse_rpc_result(&recv_buf[..amt]) {
-            Ok(msg)
-        } else {
-            Err(())
-        }
+        let amt = self.recv(&mut recv_buf)?;
+        let (_new_start, msg) = BackendSerializer::parse_rpc_result(&recv_buf[..amt])?;
+        Ok(msg)
     }
 }
+
+// TODO: Change name of error
+#[derive(Debug)]
+pub enum Error {
+    EndOfFile,
+    InvalidParse,
+    InvalidRpcId,
+    InvalidResponseId(String),
+    IoError(std::io::Error),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{:?}", self))
+    }
+}
+impl std::error::Error for Error {}
+
+pub type InternalResult<R> = Result<R, Error>;
 
 pub struct BackendSerializer;
 impl BackendSerializer {
     /// Wire format:
     /// `[MessageHeader]` | `[ExampleMessage]`
     /// Header            | Body
-    pub fn parse_rpc_recv(buf: &[u8]) -> Option<(NonZeroUsize, BackendRpcArgVariant)> {
+    pub fn parse_rpc_recv(buf: &[u8]) -> InternalResult<(NonZeroUsize, BackendRpcArgVariant)> {
         // Parse header
         let end = find_json_delimiter(buf)?.get();
-        let header = serde_json::from_slice::<MessageHeader>(&buf[..end]).ok()?;
+        let header = deserialize_from_slice::<MessageHeader>(&buf[..end])?;
         assert!(!header.is_return);
 
         // Parse Body
         let start = end;
         let end = start + header.body_size;
+        if end > buf.len() {
+            return Err(Error::EndOfFile);
+        }
         let msg = match header.rpc.as_str() {
-            EXAMPLE_RPC_ID => BackendRpcArgVariant::ExampleRpc(
-                serde_json::from_slice::<ExampleMessage>(&buf[start..end]).ok()?,
-            ),
-            // TODO(error_handling)
-            _ => panic!("Unexpected rpc type"),
+            EXAMPLE_RPC_ID => BackendRpcArgVariant::ExampleRpc(deserialize_from_slice::<
+                ExampleMessage,
+            >(&buf[start..end])?),
+            _ => return Err(Error::InvalidRpcId),
         };
-        Some((end.try_into().ok()?, msg))
+        // Unsafe ok, arrived at via addition of nonzerousize
+        Ok((unsafe { end.try_into().unwrap_unchecked() }, msg))
     }
 
-    pub fn parse_rpc_result(buf: &[u8]) -> Option<(NonZeroUsize, BackendRpcRetVariant)> {
+    pub fn parse_rpc_result(buf: &[u8]) -> InternalResult<(NonZeroUsize, BackendRpcRetVariant)> {
         // Parse header
         let end = find_json_delimiter(buf)?.get();
-        let header = serde_json::from_slice::<MessageHeader>(&buf[..end]).ok()?;
+        let header = deserialize_from_slice::<MessageHeader>(&buf[..end])?;
         assert!(header.is_return);
 
         // Parse Body
         let start = end;
         let end = start + header.body_size;
+        if end > buf.len() {
+            return Err(Error::EndOfFile);
+        }
         let msg = match header.rpc.as_str() {
-            EXAMPLE_RPC_ID => BackendRpcRetVariant::ExampleRpc(
-                serde_json::from_slice::<ExampleReturn>(&buf[start..end]).ok()?,
-            ),
-            // TODO(error_handling)
-            _ => panic!("Unexpected rpc type"),
+            EXAMPLE_RPC_ID => BackendRpcRetVariant::ExampleRpc(deserialize_from_slice::<
+                ExampleReturn,
+            >(&buf[start..end])?),
+            _ => return Err(Error::InvalidRpcId),
         };
-        Some((end.try_into().ok()?, msg))
+        // Unsafe ok, arrived at via addition of nonzerousize
+        Ok((unsafe { end.try_into().unwrap_unchecked() }, msg))
     }
 
     pub fn serialize_rpc_arg(arg: &BackendRpcArgVariant) -> Vec<u8> {
